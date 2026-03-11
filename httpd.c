@@ -7,143 +7,97 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <signal.h>
 
-void handle_request(int nfd)
+void send_error(int nfd, const char *status, const char *message)
 {
+    char body[256];
+    snprintf(body, sizeof(body), "<html><body><h1>%s</h1></body></html>", message);
+    char header[512];
+    snprintf(header, sizeof(header),
+        "HTTP/1.0 %s\r\nContent-Type: text/html\r\nContent-Length: %zu\r\n\r\n",
+        status, strlen(body));
+    write(nfd, header, strlen(header));
+    write(nfd, body, strlen(body));
+}
+
+void send_file(int nfd, const char *filepath, struct stat *st, int send_body)
+{
+    char header[512];
+    snprintf(header, sizeof(header),
+        "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: %ld\r\n\r\n",
+        st->st_size);
+    write(nfd, header, strlen(header));
+
+    if (!send_body)
+        return;
+
+    FILE *f = fopen(filepath, "r");
+    if (f == NULL)
+        return;
+
     char buf[4096];
-    ssize_t num = read(nfd, buf, sizeof(buf)-1);
+    size_t bytes;
+    while ((bytes = fread(buf, 1, sizeof(buf), f)) > 0)
+        write(nfd, buf, bytes);
 
-    if (num <= 0)
+    fclose(f);
+}
+
+void handle_cgi(int nfd, const char *filepath_full, const char *cgibuf_in)
+{
+    char cgibuf[256];
+    strncpy(cgibuf, cgibuf_in, sizeof(cgibuf)-1);
+    cgibuf[sizeof(cgibuf)-1] = '\0';
+
+    char *args[64];
+    int argc = 0;
+    char progpath[256];
+
+    char *question = strchr(cgibuf, '?');
+    if (question != NULL)
     {
-        close(nfd);
+        *question = '\0';
+        question++;
+        snprintf(progpath, sizeof(progpath), "cgi-like/%s", cgibuf);
+        args[argc++] = cgibuf;
+        char *token = strtok(question, "&");
+        while (token != NULL && argc < 63)
+        {
+            args[argc++] = token;
+            token = strtok(NULL, "&");
+        }
+    }
+    else
+    {
+        snprintf(progpath, sizeof(progpath), "cgi-like/%s", cgibuf);
+        args[argc++] = cgibuf;
+    }
+    args[argc] = NULL;
+
+    char tmpfile[64];
+    snprintf(tmpfile, sizeof(tmpfile), "/tmp/cgi_%d.tmp", getpid());
+
+    pid_t pid = fork();
+    if (pid == -1)
+    {
+        send_error(nfd, "500 Internal Error", "500 Internal Error");
         return;
     }
-
-    buf[num] = '\0';
-
-    char method[16], path[256], version[16];
-    int parsed = sscanf(buf, "%s %s %s", method, path, version);
-
-    if (parsed != 3)
+    if (pid == 0)
     {
-        char err[] = "HTTP/1.0 400 Bad Request\r\n\r\n";
-        write(nfd, err, strlen(err));
-        close(nfd);
-        return;
+        int fd = open(tmpfile, O_WRONLY|O_CREAT|O_TRUNC, 0600);
+        dup2(fd, STDOUT_FILENO);
+        close(fd);
+        execv(progpath, args);
+        exit(1);
     }
+    waitpid(pid, NULL, 0);
 
-    printf("Request: %s %s\n", method, path);
-    fflush(stdout);
-
-    if (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0)
-    {
-        char err[] = "HTTP/1.0 501 Not Implemented\r\n\r\n";
-        write(nfd, err, strlen(err));
-        close(nfd);
-        return;
-    }
-
-    char *filepath = path;
-    if (filepath[0] == '/')
-        filepath++;
-
-    if (strstr(filepath, "..") != NULL)
-    {
-        char err[] = "HTTP/1.0 403 Permission Denied\r\n\r\n";
-        write(nfd, err, strlen(err));
-        close(nfd);
-        return;
-    }
-
-    /* cgi-like handling */
-    if (strncmp(filepath, "cgi-like/", 9) == 0)
-    {
-        char cgibuf[256];
-        strncpy(cgibuf, filepath + 9, sizeof(cgibuf)-1);
-        cgibuf[sizeof(cgibuf)-1] = '\0';
-
-        char *args[64];
-        int argc = 0;
-        char progpath[256];
-
-        char *question = strchr(cgibuf, '?');
-        if (question != NULL)
-        {
-            *question = '\0';
-            question++;
-            snprintf(progpath, sizeof(progpath), "cgi-like/%s", cgibuf);
-            args[argc++] = cgibuf;
-            char *token = strtok(question, "&");
-            while (token != NULL && argc < 63)
-            {
-                args[argc++] = token;
-                token = strtok(NULL, "&");
-            }
-        }
-        else
-        {
-            snprintf(progpath, sizeof(progpath), "cgi-like/%s", cgibuf);
-            args[argc++] = cgibuf;
-        }
-        args[argc] = NULL;
-
-        char tmpfile[64];
-        snprintf(tmpfile, sizeof(tmpfile), "/tmp/cgi_%d.tmp", getpid());
-
-        pid_t pid = fork();
-        if (pid == -1)
-        {
-            char err[] = "HTTP/1.0 500 Internal Error\r\n\r\n";
-            write(nfd, err, strlen(err));
-            close(nfd);
-            return;
-        }
-        if (pid == 0)
-        {
-            int fd = open(tmpfile, O_WRONLY|O_CREAT|O_TRUNC, 0600);
-            dup2(fd, STDOUT_FILENO);
-            close(fd);
-            execv(progpath, args);
-            exit(1);
-        }
-        waitpid(pid, NULL, 0);
-
-        struct stat st;
-        if (stat(tmpfile, &st) == -1)
-        {
-            char err[] = "HTTP/1.0 500 Internal Error\r\n\r\n";
-            write(nfd, err, strlen(err));
-            close(nfd);
-            return;
-        }
-
-        char header[512];
-        snprintf(header, sizeof(header),
-            "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: %ld\r\n\r\n",
-            st.st_size);
-        write(nfd, header, strlen(header));
-
-        FILE *f = fopen(tmpfile, "r");
-        if (f != NULL)
-        {
-            char fbuf[4096];
-            size_t bytes;
-            while ((bytes = fread(fbuf, 1, sizeof(fbuf), f)) > 0)
-                write(nfd, fbuf, bytes);
-            fclose(f);
-        }
-        remove(tmpfile);
-        close(nfd);
-        return;
-    }
-
-    /* regular file handling */
     struct stat st;
-    if (stat(filepath, &st) == -1)
+    if (stat(tmpfile, &st) == -1)
     {
-        char err[] = "HTTP/1.0 404 Not Found\r\n\r\n";
-        write(nfd, err, strlen(err));
-        close(nfd);
+        send_error(nfd, "500 Internal Error", "500 Internal Error");
         return;
     }
 
@@ -153,22 +107,87 @@ void handle_request(int nfd)
         st.st_size);
     write(nfd, header, strlen(header));
 
-    if (strcmp(method, "GET") == 0)
+    FILE *f = fopen(tmpfile, "r");
+    if (f != NULL)
     {
-        FILE *f = fopen(filepath, "r");
-        if (f == NULL)
-        {
-            close(nfd);
-            return;
-        }
-        char fbuf[4096];
+        char buf[4096];
         size_t bytes;
-        while ((bytes = fread(fbuf, 1, sizeof(fbuf), f)) > 0)
-            write(nfd, fbuf, bytes);
+        while ((bytes = fread(buf, 1, sizeof(buf), f)) > 0)
+            write(nfd, buf, bytes);
         fclose(f);
     }
+    remove(tmpfile);
+}
 
-    close(nfd);
+void handle_request(int nfd)
+{
+    FILE *network = fdopen(nfd, "r");
+    if (network == NULL)
+    {
+        close(nfd);
+        return;
+    }
+
+    char *line = NULL;
+    size_t size = 0;
+    ssize_t num = getline(&line, &size, network);
+
+    if (num <= 0)
+    {
+        free(line);
+        fclose(network);
+        return;
+    }
+
+    char method[16], path[256], version[16];
+    int parsed = sscanf(line, "%s %s %s", method, path, version);
+    free(line);
+
+    if (parsed != 3)
+    {
+        send_error(nfd, "400 Bad Request", "400 Bad Request");
+        fclose(network);
+        return;
+    }
+
+    printf("Request: %s %s\n", method, path);
+    fflush(stdout);
+
+    if (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0)
+    {
+        send_error(nfd, "501 Not Implemented", "501 Not Implemented");
+        fclose(network);
+        return;
+    }
+
+    char *filepath = path;
+    if (filepath[0] == '/')
+        filepath++;
+
+    if (strstr(filepath, "..") != NULL)
+    {
+        send_error(nfd, "403 Permission Denied", "403 Permission Denied");
+        fclose(network);
+        return;
+    }
+
+    if (strncmp(filepath, "cgi-like/", 9) == 0)
+    {
+        handle_cgi(nfd, filepath, filepath + 9);
+        fclose(network);
+        return;
+    }
+
+    struct stat st;
+    if (stat(filepath, &st) == -1)
+    {
+        send_error(nfd, "404 Not Found", "404 Not Found");
+        fclose(network);
+        return;
+    }
+
+    send_file(nfd, filepath, &st, strcmp(method, "GET") == 0);
+    fclose(network);
 }
 
 void sigchld_handler(int sig)
@@ -209,6 +228,7 @@ void run_service(int fd)
         }
     }
 }
+
 int main(int argc, char *argv[])
 {
     if (argc != 2)
@@ -221,7 +241,8 @@ int main(int argc, char *argv[])
     if (port <= 0)
     {
         fprintf(stderr, "Invalid port\n");
-         }
+        exit(1);
+    }
 
     int fd = create_service(port);
     if (fd == -1)
@@ -236,4 +257,3 @@ int main(int argc, char *argv[])
     close(fd);
     return 0;
 }
-                                                                                    
