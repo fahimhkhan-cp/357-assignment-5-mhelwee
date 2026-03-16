@@ -8,6 +8,8 @@
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <errno.h>
+#include <ctype.h>
 
 void send_error(int nfd, const char *status, const char *message)
 {
@@ -23,35 +25,42 @@ void send_error(int nfd, const char *status, const char *message)
 
 void send_file(int nfd, const char *filepath, struct stat *st, int send_body)
 {
+    FILE *f = NULL;
+
+    if (send_body)
+    {
+        f = fopen(filepath, "r");
+        if (f == NULL)
+        {
+            send_error(nfd, "403 Permission Denied", "403 Permission Denied");
+            return;
+        }
+    }
+
     char header[512];
     snprintf(header, sizeof(header),
         "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: %ld\r\n\r\n",
         st->st_size);
     write(nfd, header, strlen(header));
 
-    if (!send_body)
-        return;
-
-    FILE *f = fopen(filepath, "r");
-    if (f == NULL)
-        return;
-
-    char buf[4096];
-    size_t bytes;
-    while ((bytes = fread(buf, 1, sizeof(buf), f)) > 0)
-        write(nfd, buf, bytes);
-
-    fclose(f);
+    if (send_body && f != NULL)
+    {
+        char buf[4096];
+        size_t bytes;
+        while ((bytes = fread(buf, 1, sizeof(buf), f)) > 0)
+            write(nfd, buf, bytes);
+        fclose(f);
+    }
 }
 
-void handle_cgi(int nfd, const char *filepath_full, const char *cgibuf_in)
+void handle_cgi(int nfd, const char *cgibuf_in, int send_body)
 {
     char cgibuf[256];
     strncpy(cgibuf, cgibuf_in, sizeof(cgibuf)-1);
     cgibuf[sizeof(cgibuf)-1] = '\0';
 
     char *args[64];
-    int argc = 0;
+    int nargs = 0;
     char progpath[256];
 
     char *question = strchr(cgibuf, '?');
@@ -60,20 +69,20 @@ void handle_cgi(int nfd, const char *filepath_full, const char *cgibuf_in)
         *question = '\0';
         question++;
         snprintf(progpath, sizeof(progpath), "cgi-like/%s", cgibuf);
-        args[argc++] = cgibuf;
+        args[nargs++] = cgibuf;
         char *token = strtok(question, "&");
-        while (token != NULL && argc < 63)
+        while (token != NULL && nargs < 63)
         {
-            args[argc++] = token;
+            args[nargs++] = token;
             token = strtok(NULL, "&");
         }
     }
     else
     {
         snprintf(progpath, sizeof(progpath), "cgi-like/%s", cgibuf);
-        args[argc++] = cgibuf;
+        args[nargs++] = cgibuf;
     }
-    args[argc] = NULL;
+    args[nargs] = NULL;
 
     char tmpfile[64];
     snprintf(tmpfile, sizeof(tmpfile), "/tmp/cgi_%d.tmp", getpid());
@@ -107,14 +116,17 @@ void handle_cgi(int nfd, const char *filepath_full, const char *cgibuf_in)
         st.st_size);
     write(nfd, header, strlen(header));
 
-    FILE *f = fopen(tmpfile, "r");
-    if (f != NULL)
+    if (send_body)
     {
-        char buf[4096];
-        size_t bytes;
-        while ((bytes = fread(buf, 1, sizeof(buf), f)) > 0)
-            write(nfd, buf, bytes);
-        fclose(f);
+        FILE *f = fopen(tmpfile, "r");
+        if (f != NULL)
+        {
+            char buf[4096];
+            size_t bytes;
+            while ((bytes = fread(buf, 1, sizeof(buf), f)) > 0)
+                write(nfd, buf, bytes);
+            fclose(f);
+        }
     }
     remove(tmpfile);
 }
@@ -171,9 +183,11 @@ void handle_request(int nfd)
         return;
     }
 
+    int send_body = (strcmp(method, "GET") == 0);
+
     if (strncmp(filepath, "cgi-like/", 9) == 0)
     {
-        handle_cgi(nfd, filepath, filepath + 9);
+        handle_cgi(nfd, filepath + 9, send_body);
         fclose(network);
         return;
     }
@@ -186,14 +200,16 @@ void handle_request(int nfd)
         return;
     }
 
-    send_file(nfd, filepath, &st, strcmp(method, "GET") == 0);
+    send_file(nfd, filepath, &st, send_body);
     fclose(network);
 }
 
 void sigchld_handler(int sig)
 {
+    int saved = errno;
     (void)sig;
     while (waitpid(-1, NULL, WNOHANG) > 0);
+    errno = saved;
 }
 
 void run_service(int fd)
@@ -237,12 +253,25 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
-    int port = atoi(argv[1]);
+    const char *port_str = argv[1];
+    int i;
+    for (i = 0; port_str[i] != '\0'; i++)
+    {
+        if (!isdigit((unsigned char)port_str[i]))
+        {
+            fprintf(stderr, "Invalid port\n");
+            exit(1);
+        }
+    }
+
+    int port = atoi(port_str);
     if (port <= 0)
     {
         fprintf(stderr, "Invalid port\n");
         exit(1);
     }
+
+    signal(SIGPIPE, SIG_IGN);
 
     int fd = create_service(port);
     if (fd == -1)
